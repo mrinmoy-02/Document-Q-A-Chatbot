@@ -1,71 +1,98 @@
-import streamlit as st
 import os
 import time
 from constants import  *
-from langchain_groq import ChatGroq
-from langchain_community.document_loaders import WebBaseLoader, PyMuPDFLoader
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
+import streamlit as st
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
 
-groq_api_key=GROQ_API_KEY
+groq_api_key = GROQ_API_KEY
 os.environ["HF_TOKEN"] = HF_TOKEN
 os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
 
-def vector_embedding(uploaded_file_path):
-    if 'vectors' not in st.session_state:
-        st.session_state.embeddings=HuggingFaceEmbeddings(model_name=model_id)
-        st.session_state.loader=PyMuPDFLoader(uploaded_file_path)
-        st.session_state.docs=st.session_state.loader.load()
-        st.session_state.text_splitter=RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=100)
-        st.session_state.final_documents=st.session_state.text_splitter.split_documents(st.session_state.docs[:50])
-        st.session_state.vectors=FAISS.from_documents(st.session_state.final_documents,st.session_state.embeddings)
+working_dir = os.path.dirname(os.path.abspath(__file__))
 
-st.sidebar.title("Document Q&A Chatbot")
+def load_document(file_path):
+    loader = PyMuPDFLoader(file_path)
+    documents = loader.load()
+    return documents
 
-uploaded_file=st.sidebar.file_uploader("📂 Choose a pdf  file",type=['pdf'])
+def setup_vectorstore(documents):
+    embeddings = HuggingFaceEmbeddings()
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=200
+    )
+    doc_chunks = text_splitter.split_documents(documents[:50])
+    vectorstore = FAISS.from_documents(doc_chunks, embeddings)
+    return vectorstore
 
-if uploaded_file is not None:
-    with open("temp_uploaded_file.pdf", "wb") as f:
+def create_chain(vectorstore):
+    llm = ChatGroq(
+        api_key=groq_api_key,
+        model='llama3-8b-8192'
+    )
+    retriever = vectorstore.as_retriever()
+    memory = ConversationBufferMemory(
+        llm=llm,
+        output_key="answer",
+        memory_key="chat_history",
+        return_messages=True
+    )
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        chain_type="map_reduce",
+        memory=memory,
+        verbose=True
+    )
+    return chain
+
+st.set_page_config(
+    page_title="Chat with Doc",
+    layout="centered"
+)
+
+st.title("Document Q&A Chatbot")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+uploaded_file = st.file_uploader(label="Upload pdf file", type=["pdf"])
+
+if uploaded_file:
+    file_path = f"{working_dir}/{uploaded_file.name}"
+    with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    if st.sidebar.button("Start Chat"):
-        vector_embedding("temp_uploaded_file.pdf")
-        st.sidebar.write("Your document is analyzed")
+    if "vectorstore" not in st.session_state:
+        st.session_state.vectorstore = setup_vectorstore(load_document(file_path))
 
-prompt1 = st.text_input('Enter the question')
+    if "conversation_chain" not in st.session_state:
+        st.session_state.conversation_chain = create_chain(st.session_state.vectorstore)
 
-llm = ChatGroq(
-    api_key=groq_api_key,
-    model='llama3-8b-8192')
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-prompt = ChatPromptTemplate([
-    '''
-    system, Answer the question based on the context only.
-    Please provide the most accurate response based on the question
-    <context>
-    {context}
-    </context>
-    ''',
-    ' user, Question:{input}'
-])
+user_input = st.chat_input("Ask Question...")
 
-if prompt1:
+if user_input:
     start = time.process_time()
-    docs_chain = create_stuff_documents_chain(llm, prompt)
-    retriever = st.session_state.vectors.as_retriever()
-    retrieval_chain = create_retrieval_chain(retriever, docs_chain)
-    response = retrieval_chain.invoke({'input': prompt1})
-    st.sidebar.write('Response time :', time.process_time() - start)
-    st.write(response.get('answer'))
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-    with st.expander("Document Similarity Search"):
-        for i, doc in enumerate(response["context"]):
-            st.write(doc.page_content)
-            st.write("--------------------------------")
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+        response = st.session_state.conversation_chain({"question": user_input})
+        assistant_response = response["answer"]
+        st.markdown(assistant_response)
+        st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
